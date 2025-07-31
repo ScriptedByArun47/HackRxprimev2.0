@@ -30,4 +30,7 @@ EXPOSE 8000
 
 # Start FastAPI
 CMD ["uvicorn", "app.main:app", "--reload", "--host", "0.0.0.0", "--port", "8000"]
+<<<<<<< HEAD
 
+=======
+>>>>>>> f25ab80 (Add startup warm-up logic for faster response time)

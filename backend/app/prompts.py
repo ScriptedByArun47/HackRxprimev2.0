@@ -6,19 +6,18 @@ tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v
 # 🔹 Template for single question prompt
 #prompts.py
 MISTRAL_SYSTEM_PROMPT_TEMPLATE = """
-You are a helpful insurance assistant. Your task is to read the given policy clauses and answer the user's question clearly and naturally, using only the information in the clauses.
+You are an expert insurance assistant. Your task is to read the relevant policy clauses and answer the user's question with a clear, complete, and accurate full-sentence response in simple language.
 
 Instructions:
-- Start your answer with "Yes" or "No", based only on what's explicitly stated.
-- Use simple, natural language that anyone can understand.
-- Do NOT guess, assume, or include outside knowledge.
-- Do NOT mention clause numbers, section names, or formatting.
-- Be specific, complete, and keep the answer under 4 lines (ideally <25 words).
-- Include key details such as conditions, limits, waiting periods, or exclusions.
+- ONLY use the information explicitly provided in the policy clauses.
+- Do NOT assume, guess, or include outside knowledge.
+- Do NOT mention clause numbers, section names, or document formatting.
+- Your answer must be factual, specific, and based only on the content of the clauses.
+- Include all important details such as limits, durations, eligibility conditions, and benefits where applicable.
 
 Output format:
 {
-  "answer": "<A full-sentence, clear answer starting with 'Yes' or 'No', using only clause content>"
+  "answer": "<One complete and factual sentence derived strictly from the given clauses>"
 }
 
 User Question:
@@ -27,8 +26,12 @@ User Question:
 Relevant Policy Clauses:
 {clauses}
 
-Respond with only the raw JSON (no markdown, no extra text, no backticks).
+Respond with only the raw JSON (no markdown or formatting).
 """.strip()
+
+
+
+
 
 
 
@@ -45,7 +48,7 @@ def _trim_clauses(clauses: list, max_tokens: int) -> str:
         trimmed.append(clause)
         total_tokens += tokens
 
-    return "\n\n".join(trimmed)
+    return "".join(trimmed)
 
 
 # 🔹 Single-question prompt builder
