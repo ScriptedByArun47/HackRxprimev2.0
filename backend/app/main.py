@@ -13,6 +13,9 @@ import os
 import json
 import re
 import asyncio
+import hashlib
+from difflib import SequenceMatcher
+from app.prompts import count_tokens  # Optional token logger
 
 # Load environment variables
 load_dotenv()
@@ -22,10 +25,11 @@ genai.configure(api_key=api_key)
 # FastAPI app
 app = FastAPI()
 
-# Global variables for warm-up
+# Global variables
 model = None
 tokenizer = None
 genai_model = None
+clause_cache = {}
 
 @app.on_event("startup")
 async def warmup():
@@ -34,11 +38,10 @@ async def warmup():
     model = SentenceTransformer("all-MiniLM-L6-v2")
     tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
     print("🤖 Initializing Gemini...")
-    genai_model = genai.GenerativeModel('models/gemini-1.5-flash')
+    genai_model = genai.GenerativeModel('models/gemini-2.0-flash')
     _ = model.encode(["Test warmup"])
     print("✅ Warmup complete.")
 
-# Allow CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,11 +54,14 @@ class HackRxRequest(BaseModel):
     documents: Union[str, List[str]]
     questions: List[str]
 
-def build_faiss_index(clauses: List[Dict]) -> tuple:
-    texts = [c["clause"] for c in clauses]
-    vectors = model.encode(texts)
-    index = faiss.IndexFlatL2(vectors.shape[1])
+def hash_url(url):
+    return hashlib.sha256(url.encode()).hexdigest()
+
+def build_faiss_index(clauses_with_embeddings):
+    vectors = [c["embedding"] for c in clauses_with_embeddings]
+    index = faiss.IndexFlatL2(len(vectors[0]))
     index.add(np.array(vectors))
+    texts = [c["clause"] for c in clauses_with_embeddings]
     return index, texts
 
 def extract_keywords(question: str) -> List[str]:
@@ -63,7 +69,7 @@ def extract_keywords(question: str) -> List[str]:
     stopwords = {"what", "is", "the", "of", "under", "a", "an", "how", "for", "and", "in", "on", "to", "does", "do", "are"}
     return [t for t in tokens if t not in stopwords and len(t) > 2]
 
-def get_top_clauses(question: str, index, texts: List[str], k: int = 15) -> List[str]:
+def get_top_clauses(question: str, index, texts: List[str], k: int = 7) -> List[str]:
     q_vector = model.encode([question])
     _, I = index.search(np.array(q_vector), k)
     top_clauses = [texts[i] for i in I[0]]
@@ -76,11 +82,22 @@ def get_top_clauses(question: str, index, texts: List[str], k: int = 15) -> List
 
     return sorted(combined, key=keyword_score, reverse=True)[:7]
 
-def trim_clauses(clauses: List[Dict[str, str]], max_tokens: int = 1200) -> List[Dict[str, str]]:
+# 🧠 Clause deduplication utility
+def _deduplicate_clauses(clauses: List[str], threshold: float = 0.9) -> List[str]:
+    unique = []
+    for clause in clauses:
+        clause = clause.strip()
+        if not clause:
+            continue
+        if not any(SequenceMatcher(None, clause, u).ratio() > threshold for u in unique):
+            unique.append(clause)
+    return unique
+
+def trim_clauses(clauses: List[str], max_tokens: int = 1000) -> List[Dict[str, str]]:
+    deduped = _deduplicate_clauses(clauses)
     result = []
     total = 0
-    for clause_obj in clauses:
-        clause = clause_obj["clause"]
+    for clause in deduped:
         tokens = len(tokenizer.tokenize(clause))
         if total + tokens > max_tokens:
             break
@@ -111,11 +128,8 @@ async def call_llm(prompt: str, offset: int, batch_size: int) -> Dict[str, Dict[
             contents=[{"role": "user", "parts": [prompt]}],
             generation_config={"response_mime_type": "application/json"},
         )
-        content = response.text.strip().lstrip("```json").rstrip("```").strip()
+        content = response.text.strip().lstrip("json").rstrip("").strip()
         parsed = json.loads(content)
-
-        if hasattr(response, "usage_metadata"):
-            print(f"🔢 Tokens used in batch {offset // batch_size + 1}: {response.usage_metadata.total_token_count}")
 
         return {
             f"Q{offset + i + 1}": parsed.get(f"Q{i + 1}", {"answer": "No answer found."})
@@ -131,25 +145,38 @@ async def call_llm(prompt: str, offset: int, batch_size: int) -> Dict[str, Dict[
 @app.post("/hackrx/run")
 async def hackrx_run(req: HackRxRequest):
     doc_urls = req.documents if isinstance(req.documents, list) else [req.documents]
-    all_clauses = []
+    all_clauses_with_embeddings = []
 
     for url in doc_urls:
-        try:
-            all_clauses.extend(extract_clauses_from_url(url))
-        except Exception as e:
-            print(f"❌ Failed to extract from URL {url}:", e)
+        url_hash = hash_url(url)
+        if url_hash in clause_cache:
+            all_clauses_with_embeddings.extend(clause_cache[url_hash])
+        else:
+            try:
+                raw_clauses = extract_clauses_from_url(url)
+                for clause_obj in raw_clauses:
+                    embedding = model.encode(clause_obj["clause"])
+                    clause_obj["embedding"] = embedding
+                clause_cache[url_hash] = raw_clauses
+                all_clauses_with_embeddings.extend(raw_clauses)
+            except Exception as e:
+                print(f"❌ Failed to extract from URL {url}:", e)
 
-    index, clause_texts = build_faiss_index(all_clauses)
+    index, clause_texts = build_faiss_index(all_clauses_with_embeddings)
 
     question_clause_map = {}
     for question in req.questions:
         top = get_top_clauses(question, index, clause_texts)
-        trimmed = trim_clauses([{"clause": c} for c in top])
+        trimmed = trim_clauses(top)
         question_clause_map[question] = trimmed
 
-    batch_size = (len(req.questions) + 4) // 5
+    batch_size = 10
     batches = [list(question_clause_map.items())[i:i + batch_size] for i in range(0, len(req.questions), batch_size)]
     prompts = [build_prompt_batch(dict(batch)) for batch in batches]
+
+    # 🔹 Optional: Token count debug
+    for i, prompt in enumerate(prompts):
+        print(f"Batch {i+1}: {len(batches[i])} Qs | {count_tokens(prompt)} tokens")
 
     tasks = [call_llm(prompt, i * batch_size, len(batch)) for i, (prompt, batch) in enumerate(zip(prompts, batches))]
     results = await asyncio.gather(*tasks)
